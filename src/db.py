@@ -83,6 +83,52 @@ def get_client():
         return None
 
 
+
+def _current_user_id() -> Optional[str]:
+    """Return the currently authenticated Supabase user's UUID."""
+    client = get_client()
+    if client is None:
+        return None
+    try:
+        response = client.auth.get_user()
+        user = getattr(response, "user", None)
+        if user is None and isinstance(response, dict):
+            user = response.get("user")
+        if user is None:
+            return None
+        return user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+    except Exception as e:
+        print(f"[Supabase] Could not get authenticated user: {e}")
+        return None
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _skills_to_text(skills: Any) -> str:
+    if skills is None:
+        return ""
+    if isinstance(skills, (list, tuple, set)):
+        return ", ".join(str(x) for x in skills)
+    return str(skills)
+
+
+def _skills_to_list(skills: Any) -> list:
+    if skills is None:
+        return []
+    if isinstance(skills, list):
+        return skills
+    if isinstance(skills, str):
+        return [x.strip() for x in skills.split(",") if x.strip()]
+    return list(skills) if isinstance(skills, (tuple, set)) else [str(skills)]
+
+
 def test_connection() -> Tuple[bool, str]:
     """Test connectivity to Supabase by querying the requisitions table."""
     if not is_configured():
@@ -106,7 +152,16 @@ def fetch_requisitions() -> Dict[str, dict]:
     if not client:
         return {}
     try:
-        res = client.table("requisitions").select("*").order("created_at").execute()
+        uid = _current_user_id()
+        if not uid:
+            return {}
+        res = (
+            client.table("requisitions")
+            .select("*")
+            .eq("hr_user_id", uid)
+            .order("created_at")
+            .execute()
+        )
         reqs = {}
         rows: Any = res.data or []
         for r in rows:
@@ -118,13 +173,15 @@ def fetch_requisitions() -> Dict[str, dict]:
                     created = datetime.now()
             reqs[r["id"]] = {
                 "id": r["id"],
-                "title": r["title"],
-                "department": r["department"],
-                "jd_text": r["jd_text"],
-                "required_skills": r.get("required_skills") or [],
-                "min_years": float(r.get("min_years") or 0),
+                "title": r.get("job_title") or "",
+                "department": r.get("department") or "",
+                "location": r.get("location") or "",
+                "jd_text": r.get("job_description") or "",
+                "required_skills": _skills_to_list(r.get("required_skills")),
+                "min_years": _safe_float(r.get("experience_required")),
                 "required_education": r.get("required_education") or "Not detected",
                 "created_at": created or datetime.now(),
+                "status": r.get("status") or "active",
             }
         return reqs
     except Exception:
@@ -132,30 +189,72 @@ def fetch_requisitions() -> Dict[str, dict]:
 
 
 def save_requisition(req: dict) -> bool:
-    """Insert or update a requisition in Supabase."""
+    """Insert/update a requisition using the actual Supabase schema."""
     client = get_client()
     if not client:
         return False
+
+    uid = _current_user_id()
+    if not uid:
+        print("[Supabase] save_requisition: no authenticated user.")
+        return False
+
     try:
         created_at = req.get("created_at")
-        if isinstance(created_at, datetime):
-            created_str = created_at.isoformat()
-        else:
-            created_str = datetime.now().isoformat()
+        created_str = (
+            created_at.isoformat()
+            if isinstance(created_at, datetime)
+            else str(created_at or datetime.now().isoformat())
+        )
 
         row = {
             "id": req["id"],
-            "title": req["title"],
-            "department": req["department"],
-            "jd_text": req["jd_text"],
-            "required_skills": req.get("required_skills") or [],
-            "min_years": float(req.get("min_years") or 0),
-            "required_education": req.get("required_education") or "Not detected",
+            "hr_user_id": uid,
+            "job_title": req.get("title") or req.get("job_title") or "",
+            "department": req.get("department") or "",
+            "location": req.get("location") or "",
+            "experience_required": str(
+                req.get("experience_required")
+                or req.get("min_years")
+                or "0"
+            ),
+            "job_description": req.get("jd_text")
+                or req.get("job_description")
+                or "",
+            "required_skills": _skills_to_text(req.get("required_skills")),
+            "status": req.get("status") or "active",
             "created_at": created_str,
+            "updated_at": datetime.now().isoformat(),
         }
-        client.table("requisitions").upsert(row, on_conflict="id").execute()
+
+        # Upsert only within the authenticated HR user's workspace.
+        existing = (
+            client.table("requisitions")
+            .select("id")
+            .eq("id", req["id"])
+            .eq("hr_user_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            response = (
+                client.table("requisitions")
+                .update(row)
+                .eq("id", req["id"])
+                .eq("hr_user_id", uid)
+                .execute()
+            )
+        else:
+            response = client.table("requisitions").insert(row).execute()
+
+        if not response.data:
+            print("[Supabase] save_requisition: database returned no row.")
+            return False
+
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[Supabase] save_requisition error: {e}")
         return False
 
 
@@ -209,42 +308,43 @@ def fetch_results(req_id: str) -> list:
 
 
 def upload_resume_file(filename: str, file_bytes: bytes, req_id: str = "general") -> Optional[str]:
-    """Upload a resume file to the Supabase storage bucket ('Resumes' or 'resume').
-    Returns the storage path / identifier if successful, else None."""
+    """Upload resume to the private resumes bucket and create its DB record."""
     client = get_client()
-    if not client:
+    uid = _current_user_id()
+    if not client or not uid:
         return None
 
     safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", filename)
-    storage_path = f"{req_id}/{safe_name}"
+    storage_path = f"{uid}/{req_id}/{safe_name}"
     content_type, _ = mimetypes.guess_type(filename)
-    if not content_type:
-        content_type = "text/plain" if filename.endswith((".txt", ".md")) else "application/octet-stream"
+    content_type = content_type or "application/octet-stream"
 
-    file_options: Any = {
-        "content-type": content_type,
-        "upsert": "true",
-    }
+    try:
+        client.storage.from_("resumes").upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={"content-type": content_type, "upsert": "true"},
+        )
 
-    # Support common bucket names
-    candidate_buckets = ["resumes", "Resumes", "resume", "Resume"]
-    for bucket in candidate_buckets:
-        try:
-            client.storage.from_(bucket).upload(
-                path=storage_path,
-                file=file_bytes,
-                file_options=file_options,
-            )
-            return storage_path
-        except Exception as e:
-            err_str = str(e)
-            if "Bucket not found" in err_str or "not found" in err_str.lower():
-                continue
-            # Log failure details for debugging
-            print(f"[Supabase Storage] Upload failed for bucket '{bucket}': {err_str}")
-
-    return None
-
+        row = {
+            "hr_user_id": uid,
+            "requisition_id": req_id,
+            "candidate_name": os.path.splitext(os.path.basename(filename))[0],
+            "file_name": filename,
+            "storage_path": storage_path,
+            "file_size": len(file_bytes),
+            "mime_type": content_type,
+            "status": "uploaded",
+            "updated_at": datetime.now().isoformat(),
+        }
+        result = client.table("resumes").insert(row).execute()
+        if not result.data:
+            print("[Supabase] Storage upload succeeded but resume DB insert failed.")
+            return None
+        return storage_path
+    except Exception as e:
+        print(f"[Supabase] upload_resume_file error: {e}")
+        return None
 
 def save_results(req_id: str, results: list, existing_actions: Optional[Dict] = None) -> bool:
     """Batch upsert candidate screening results into Supabase."""
@@ -398,15 +498,288 @@ def save_email_log(req_id: str, candidate_name: str, message: str) -> bool:
 # Full Reset
 # --------------------------------------------------------------------------
 def reset_all_data() -> bool:
-    """Deletes all data across all tables in Supabase."""
+    """Delete the signed-in HR user's requisitions and resume records."""
     client = get_client()
-    if not client:
+    uid = _current_user_id()
+    if not client or not uid:
         return False
+
     try:
-        client.table("email_logs").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-        client.table("interview_guides").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-        client.table("candidates").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
-        client.table("requisitions").delete().neq("id", "").execute()
+        client.table("resumes").delete().eq("hr_user_id", uid).execute()
+        client.table("requisitions").delete().eq("hr_user_id", uid).execute()
         return True
-    except Exception:
+    except Exception as e:
+        print(f"[Supabase] reset_all_data error: {e}")
         return False
+ # ---------------------------------------------------------------------------
+# HR SETTINGS - SUPABASE CLOUD PERSISTENCE
+# ---------------------------------------------------------------------------
+
+def fetch_hr_settings() -> Dict[str, Any]:
+    """Fetch the logged-in HR user's settings from Supabase."""
+    client = get_client()
+    uid = _current_user_id()
+
+    if client is None or not uid:
+        return {}
+
+    try:
+        response = (
+            client.table("hr_settings")
+            .select("*")
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        rows = response.data or []
+        return rows[0] if rows else {}
+
+    except Exception as e:
+        print(f"[Supabase] fetch_hr_settings error: {e}")
+        return {}
+
+
+def save_hr_settings(settings: Dict[str, Any]) -> bool:
+    """Create or replace the logged-in HR user's cloud settings."""
+    client = get_client()
+    uid = _current_user_id()
+
+    if client is None or not uid:
+        return False
+
+    try:
+        data = {
+            "user_id": uid,
+            "company_name": str(settings.get("company_name", "")),
+            "hr_sender_name": str(settings.get("hr_sender_name", "")),
+            "hr_sender_title": str(settings.get("hr_sender_title", "")),
+            "seed_demo_requisition": bool(
+                settings.get("seed_demo_requisition", True)
+            ),
+            "semantic_backend": str(
+                settings.get("semantic_backend", "auto")
+            ),
+            "default_weights": settings.get("default_weights", {}),
+            "custom_skills": settings.get("custom_skills", []),
+        }
+
+        client.table("hr_settings").upsert(
+            data,
+            on_conflict="user_id"
+        ).execute()
+
+        return True
+
+    except Exception as e:
+        print(f"[Supabase] save_hr_settings error: {e}")
+        return False
+
+
+def update_hr_settings(**updates) -> bool:
+    """Update selected settings for the logged-in HR user."""
+    client = get_client()
+    uid = _current_user_id()
+
+    if client is None or not uid:
+        return False
+
+    allowed_fields = {
+        "company_name",
+        "hr_sender_name",
+        "hr_sender_title",
+        "seed_demo_requisition",
+        "semantic_backend",
+        "default_weights",
+        "custom_skills",
+    }
+
+    data = {
+        key: value
+        for key, value in updates.items()
+        if key in allowed_fields
+    }
+
+    if not data:
+        return False
+
+    try:
+        data["updated_at"] = datetime.utcnow().isoformat()
+
+        client.table("hr_settings").upsert(
+            {
+                "user_id": uid,
+                **data,
+            },
+            on_conflict="user_id"
+        ).execute()
+
+        return True
+
+    except Exception as e:
+        print(f"[Supabase] update_hr_settings error: {e}")
+        return False
+
+
+def ensure_hr_settings() -> Dict[str, Any]:
+    """
+    Return cloud settings for the current HR user.
+
+    If the user does not have a settings row yet, create one
+    using the database defaults.
+    """
+    existing = fetch_hr_settings()
+
+    if existing:
+        return existing
+
+    defaults = {
+        "company_name": "",
+        "hr_sender_name": "",
+        "hr_sender_title": "",
+        "seed_demo_requisition": True,
+        "semantic_backend": "auto",
+        "default_weights": {},
+        "custom_skills": [],
+    }
+
+    if save_hr_settings(defaults):
+        return fetch_hr_settings()
+
+    return defaults
+# ---------------------------------------------------------------------------
+# HR SETTINGS - SUPABASE CLOUD PERSISTENCE
+# ---------------------------------------------------------------------------
+
+def fetch_hr_settings() -> Dict[str, Any]:
+    """Fetch the logged-in HR user's settings from Supabase."""
+    client = get_client()
+    uid = _current_user_id()
+
+    if client is None or not uid:
+        return {}
+
+    try:
+        response = (
+            client.table("hr_settings")
+            .select("*")
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        rows = response.data or []
+        return rows[0] if rows else {}
+
+    except Exception as e:
+        print(f"[Supabase] fetch_hr_settings error: {e}")
+        return {}
+
+
+def save_hr_settings(settings: Dict[str, Any]) -> bool:
+    """Create or replace the logged-in HR user's cloud settings."""
+    client = get_client()
+    uid = _current_user_id()
+
+    if client is None or not uid:
+        return False
+
+    try:
+        data = {
+            "user_id": uid,
+            "company_name": str(settings.get("company_name", "")),
+            "hr_sender_name": str(settings.get("hr_sender_name", "")),
+            "hr_sender_title": str(settings.get("hr_sender_title", "")),
+            "seed_demo_requisition": bool(
+                settings.get("seed_demo_requisition", True)
+            ),
+            "semantic_backend": str(
+                settings.get("semantic_backend", "auto")
+            ),
+            "default_weights": settings.get("default_weights", {}),
+            "custom_skills": settings.get("custom_skills", []),
+        }
+
+        client.table("hr_settings").upsert(
+            data,
+            on_conflict="user_id"
+        ).execute()
+
+        return True
+
+    except Exception as e:
+        print(f"[Supabase] save_hr_settings error: {e}")
+        return False
+
+
+def update_hr_settings(**updates) -> bool:
+    """Update selected settings for the logged-in HR user."""
+    client = get_client()
+    uid = _current_user_id()
+
+    if client is None or not uid:
+        return False
+
+    allowed_fields = {
+        "company_name",
+        "hr_sender_name",
+        "hr_sender_title",
+        "seed_demo_requisition",
+        "semantic_backend",
+        "default_weights",
+        "custom_skills",
+    }
+
+    data = {
+        key: value
+        for key, value in updates.items()
+        if key in allowed_fields
+    }
+
+    if not data:
+        return False
+
+    try:
+        data["updated_at"] = datetime.utcnow().isoformat()
+
+        client.table("hr_settings").upsert(
+            {
+                "user_id": uid,
+                **data,
+            },
+            on_conflict="user_id"
+        ).execute()
+
+        return True
+
+    except Exception as e:
+        print(f"[Supabase] update_hr_settings error: {e}")
+        return False
+
+
+def ensure_hr_settings() -> Dict[str, Any]:
+    """
+    Return cloud settings for the current HR user.
+
+    If the user does not have a settings row yet, create one
+    using the database defaults.
+    """
+    existing = fetch_hr_settings()
+
+    if existing:
+        return existing
+
+    defaults = {
+        "company_name": "",
+        "hr_sender_name": "",
+        "hr_sender_title": "",
+        "seed_demo_requisition": True,
+        "semantic_backend": "auto",
+        "default_weights": {},
+        "custom_skills": [],
+    }
+
+    if save_hr_settings(defaults):
+        return fetch_hr_settings()
+
+    return defaults

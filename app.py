@@ -6,6 +6,7 @@ semantic + skill matching, and full per-candidate explainability.
 import datetime as dt
 import html
 import io
+import uuid
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -124,15 +125,35 @@ def init_state():
     ss.setdefault("semantic_backend", "auto")
     ss.setdefault("default_weights", dict(WEIGHTS))  # org-wide default scoring weights (fractions summing to 1.0)
     ss.setdefault("custom_skills", [])      # extra taxonomy terms recruiters have added (e.g. LangGraph, vLLM)
-    # Organization identity, workspace defaults and SMTP credentials are
-    # PERSISTENT: loaded from disk once per new session (see src/settings_store.py)
-    # so they survive page refreshes and app restarts until the user changes them.
-    # Each signed-in account has its own copy of all three (see src/auth.py).
+    # Organization identity and app preferences are persisted in Supabase.
+    # SMTP credentials remain in the existing private settings store and are
+    # never written to the normal hr_settings database table.
     uid = current_user_id()
+    if "cloud_hr_settings" not in ss:
+        ss["cloud_hr_settings"] = db.ensure_hr_settings()
+
+    cloud_settings = ss.get("cloud_hr_settings", {})
+
     if "org_settings" not in ss:
-        ss["org_settings"] = settings_store.load_org_settings(uid)
+        ss["org_settings"] = {
+            "company_name": cloud_settings.get("company_name", ""),
+            "hr_sender_name": cloud_settings.get("hr_sender_name", ""),
+            "hr_sender_title": cloud_settings.get("hr_sender_title", ""),
+        }
+
     if "app_prefs" not in ss:
-        ss["app_prefs"] = settings_store.load_app_prefs(uid)
+        ss["app_prefs"] = {
+            "seed_demo_requisition": cloud_settings.get("seed_demo_requisition", True),
+            "semantic_backend": cloud_settings.get("semantic_backend", "auto"),
+            "default_weights": cloud_settings.get("default_weights", dict(WEIGHTS)) or dict(WEIGHTS),
+            "custom_skills": cloud_settings.get("custom_skills", []) or [],
+        }
+
+    # Keep the legacy top-level state keys in sync with cloud settings.
+    ss["semantic_backend"] = ss["app_prefs"].get("semantic_backend", "auto")
+    ss["default_weights"] = ss["app_prefs"].get("default_weights", dict(WEIGHTS)) or dict(WEIGHTS)
+    ss["custom_skills"] = list(ss["app_prefs"].get("custom_skills", []) or [])
+
     if "smtp_config" not in ss:
         ss["smtp_config"] = settings_store.load_smtp_config(uid)
     ss.setdefault("interview_guides", {})  # (req_id, candidate_id) -> list[question dicts]
@@ -157,7 +178,7 @@ def seed_default_requisition():
     jds = list_sample_jds()
     jd_text = jds.get("Machine Learning", "")
     parsed = parse_job_description(jd_text, extra_skills=st.session_state.get("custom_skills"))
-    req_id = "req_1"
+    req_id = str(uuid.uuid4())
     req_data = {
         "id": req_id,
         "title": "Machine Learning Engineer",
@@ -177,7 +198,7 @@ def seed_default_requisition():
 
 def new_req_id():
     st.session_state["req_counter"] += 1
-    return f"req_{st.session_state['req_counter']}"
+    return str(uuid.uuid4())
 
 
 def get_active_req():
@@ -1263,7 +1284,15 @@ def page_settings():
     d_exp = wc3.slider("Experience Evidence %", 0, 100, round(dw["experience_evidence"] * 100), key="dw_exp")
     d_edu = wc4.slider("Education Evidence %", 0, 100, round(dw["education_evidence"] * 100), key="dw_edu")
     d_total = d_sem + d_skl + d_exp + d_edu
-    st.session_state["default_weights"] = _normalized_weights(d_sem, d_skl, d_exp, d_edu)
+    normalized = _normalized_weights(d_sem, d_skl, d_exp, d_edu)
+    previous_weights = st.session_state.get("default_weights", dict(WEIGHTS))
+    st.session_state["default_weights"] = normalized
+    st.session_state["app_prefs"]["default_weights"] = normalized
+    if normalized != previous_weights:
+        if db.update_hr_settings(default_weights=normalized):
+            st.session_state["cloud_hr_settings"]["default_weights"] = normalized
+        else:
+            st.warning("Scoring weights changed for this session, but Supabase could not save them.")
     st.caption(f"Sliders sum to {d_total}% and are normalized to 100% automatically. "
                "This becomes the default for newly created requisitions — existing ones keep their own weights "
                "until edited.")
@@ -1281,6 +1310,11 @@ def page_settings():
     if st.button("➕ Add skill") and new_custom.strip():
         if new_custom.strip() not in st.session_state["custom_skills"]:
             st.session_state["custom_skills"].append(new_custom.strip())
+            st.session_state["app_prefs"]["custom_skills"] = list(st.session_state["custom_skills"])
+            if db.update_hr_settings(custom_skills=st.session_state["custom_skills"]):
+                st.session_state["cloud_hr_settings"]["custom_skills"] = list(st.session_state["custom_skills"])
+            else:
+                st.warning("Custom skill added for this session, but Supabase could not save it.")
         st.rerun()
     if st.session_state["custom_skills"]:
         st.caption("Current custom skills (click ✖ to remove):")
@@ -1289,6 +1323,11 @@ def page_settings():
             with cs_cols[i % 4]:
                 if st.button(f"✖ {skill}", key=f"rm_custom_skill_{i}"):
                     st.session_state["custom_skills"].remove(skill)
+                    st.session_state["app_prefs"]["custom_skills"] = list(st.session_state["custom_skills"])
+                    if db.update_hr_settings(custom_skills=st.session_state["custom_skills"]):
+                        st.session_state["cloud_hr_settings"]["custom_skills"] = list(st.session_state["custom_skills"])
+                    else:
+                        st.warning("Custom skill removed for this session, but Supabase could not save it.")
                     st.rerun()
     else:
         st.caption("No custom skills added yet.")
@@ -1316,7 +1355,14 @@ def page_settings():
         "Engine", list(engine_labels.keys()), index=list(engine_labels.keys()).index(current),
         format_func=lambda k: engine_labels[k], label_visibility="collapsed",
     )
-    st.session_state["semantic_backend"] = choice
+    if choice != st.session_state.get("semantic_backend", "auto"):
+        st.session_state["semantic_backend"] = choice
+        st.session_state["app_prefs"]["semantic_backend"] = choice
+        if db.update_hr_settings(semantic_backend=choice):
+            st.session_state["cloud_hr_settings"]["semantic_backend"] = choice
+            st.toast("Semantic engine preference saved to Supabase.")
+        else:
+            st.warning("Semantic engine changed for this session, but Supabase could not save it.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown(
@@ -1364,11 +1410,12 @@ def page_settings():
                 "hr_sender_title": new_title.strip(),
             }
             org.update(updated)
-            if settings_store.save_org_settings(updated, current_user_id()):
-                st.success("Organization details saved.")
+            ok = db.update_hr_settings(**updated)
+            if ok:
+                st.session_state["cloud_hr_settings"].update(updated)
+                st.success("Organization details saved to Supabase.")
             else:
-                st.warning("Saved for this session, but the settings file isn't writable here, "
-                           "so they won't survive a restart.")
+                st.warning("Saved for this session, but Supabase could not save the settings.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     can_save_smtp = settings_store.smtp_saving_enabled()
@@ -1484,7 +1531,7 @@ def page_settings():
 
     st.markdown('<div class="tiq-card"><h4>Cloud Data & Persistence</h4>', unsafe_allow_html=True)
     if db.is_configured():
-        st.caption("All requisitions, screened candidates, interview guides, and email logs are synchronized with your Supabase database.")
+        st.caption("Requisitions, resumes, screened candidates, interview guides, email logs, and HR settings are synchronized with your Supabase database. SMTP credentials remain in the separate private credential store.")
     else:
         st.caption("Supabase is not configured — running in session-only mode.")
     prefs = st.session_state["app_prefs"]
@@ -1495,8 +1542,11 @@ def page_settings():
     )
     if seed_demo != prefs.get("seed_demo_requisition", True):
         prefs["seed_demo_requisition"] = seed_demo
-        settings_store.save_app_prefs(prefs, current_user_id())
-        st.toast("Preference saved — applies from the next new session.")
+        if db.update_hr_settings(seed_demo_requisition=seed_demo):
+            st.session_state["cloud_hr_settings"]["seed_demo_requisition"] = seed_demo
+            st.toast("Preference saved to Supabase — applies from the next new session.")
+        else:
+            st.warning("Preference changed for this session, but Supabase could not save it.")
     if st.button("🗑 Reset all data (Clear Supabase & Session)"):
         db.reset_all_data()
         for key in ["requisitions", "results", "candidate_actions", "active_req_id", "req_counter",
